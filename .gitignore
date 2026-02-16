@@ -5,9 +5,13 @@ white_noise
 # 生成された音声ファイル
 *.wav
 
+# ドキュメント
+document/
+
 # C コンパイル成果物
 *.o
 *.out
 *.a
 *.so
 a.out
+
