@@ -1,9 +1,20 @@
 # 実行ファイル
 tsp_gen
 white_noise
+tsp_to_ir
+ir_analyze
+adaptive_filter
+down_gen
 
 # 生成された音声ファイル
 *.wav
+
+# 解析結果ファイル
+*.txt
+decay_curve.txt
+impulse_response*.wav
+tsp_response.wav
+white_noise_response.wav
 
 # ドキュメント
 document/
@@ -14,4 +25,20 @@ document/
 *.a
 *.so
 a.out
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# エディタ関連
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# 一時ファイル
+*.tmp
+*.log
 
