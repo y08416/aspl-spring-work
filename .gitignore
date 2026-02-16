@@ -1,0 +1,13 @@
+# 実行ファイル
+tsp_gen
+white_noise
+
+# 生成された音声ファイル
+*.wav
+
+# C コンパイル成果物
+*.o
+*.out
+*.a
+*.so
+a.out
