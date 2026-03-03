@@ -172,14 +172,21 @@ int write_wav(const char *filename, int16_t *samples, int num_samples, int fs) {
 }
 
 int main(int argc, char *argv[]) {
-    const char *tsp_file = (argc > 1) ? argv[1] : "tsp_signal.wav";
-    const char *response_file = (argc > 2) ? argv[2] : "tsp_response.wav";
-    const char *output_file = (argc > 3) ? argv[3] : "impulse_response.wav";
+    if (argc < 4) {
+        fprintf(stderr, "使用方法: %s tsp_signal.wav response1.wav [response2.wav ...] impulse_response.wav\n", argv[0]);
+        fprintf(stderr, "応答ファイルは1つ以上指定してください。\n");
+        return 1;
+    }
+
+    const char *tsp_file = argv[1];
+    const char *output_file = argv[argc - 1];
+    int num_response_files = argc - 3;
 
     printf("TSP信号からインパルス応答を算出中...\n");
     printf("TSP信号: %s\n", tsp_file);
-    printf("TSP応答: %s\n", response_file);
-    printf("出力: %s\n", output_file);
+    printf("TSP応答: %d ファイル", num_response_files);
+    for (int i = 0; i < num_response_files; i++) printf(" %s%s", argv[2 + i], (i < num_response_files - 1) ? "," : "");
+    printf("\n出力: %s\n", output_file);
 
     // 1. TSP信号を読み込む
     int16_t *tsp_samples = NULL;
@@ -191,23 +198,73 @@ int main(int argc, char *argv[]) {
     }
     printf("TSP信号: %d サンプル, fs = %d Hz\n", tsp_len, fs_tsp);
 
-    // 2. TSP応答を読み込む
-    int16_t *response_samples = NULL;
-    int fs_response;
-    int response_len = read_wav(response_file, &response_samples, &fs_response);
-    if (response_len < 0) {
-        fprintf(stderr, "エラー: TSP応答の読み込みに失敗\n");
-        free(tsp_samples);
-        return 1;
+    // 2. 複数のTSP応答を読み込み、時間領域で平均化
+    int16_t **response_buffers = (int16_t **)malloc(num_response_files * sizeof(int16_t *));
+    int *response_lengths = (int *)malloc(num_response_files * sizeof(int));
+    int fs_response = 0;
+    int min_response_len = 0;
+
+    for (int f = 0; f < num_response_files; f++) {
+        int fs_file;
+        int len = read_wav(argv[2 + f], &response_buffers[f], &fs_file);
+        if (len < 0) {
+            fprintf(stderr, "エラー: TSP応答 %s の読み込みに失敗\n", argv[2 + f]);
+            for (int j = 0; j < f; j++) free(response_buffers[j]);
+            free(response_buffers);
+            free(response_lengths);
+            free(tsp_samples);
+            return 1;
+        }
+        if (f == 0) {
+            fs_response = fs_file;
+        } else if (fs_response != fs_file) {
+            fprintf(stderr, "エラー: 応答ファイルのサンプリング周波数が一致しません (%s: %d Hz)\n", argv[2 + f], fs_file);
+            for (int j = 0; j <= f; j++) free(response_buffers[j]);
+            free(response_buffers);
+            free(response_lengths);
+            free(tsp_samples);
+            return 1;
+        }
+        response_lengths[f] = len;
+        if (f == 0 || len < min_response_len) min_response_len = len;
     }
-    printf("TSP応答: %d サンプル, fs = %d Hz\n", response_len, fs_response);
 
     if (fs_tsp != fs_response) {
-        fprintf(stderr, "エラー: サンプリング周波数が一致しません\n");
+        fprintf(stderr, "エラー: サンプリング周波数が一致しません (TSP: %d, 応答: %d)\n", fs_tsp, fs_response);
+        for (int f = 0; f < num_response_files; f++) free(response_buffers[f]);
+        free(response_buffers);
+        free(response_lengths);
         free(tsp_samples);
-        free(response_samples);
         return 1;
     }
+
+    // 時間領域で平均（最短長に揃える）
+    int response_len = min_response_len;
+    double *response_sum = (double *)calloc(response_len, sizeof(double));
+    for (int f = 0; f < num_response_files; f++) {
+        for (int i = 0; i < response_len; i++) {
+            response_sum[i] += (double)response_buffers[f][i] / 32768.0;
+        }
+    }
+    for (int i = 0; i < response_len; i++) {
+        response_sum[i] /= num_response_files;
+    }
+
+    int16_t *response_samples = (int16_t *)malloc(response_len * sizeof(int16_t));
+    for (int i = 0; i < response_len; i++) {
+        double s = response_sum[i] * 32768.0;
+        if (s > 32767.0) s = 32767.0;
+        if (s < -32768.0) s = -32768.0;
+        response_samples[i] = (int16_t)s;
+    }
+
+    printf("TSP応答: %d ファイルを平均、%d サンプル, fs = %d Hz\n", num_response_files, response_len, fs_response);
+
+    // 一時バッファ解放
+    for (int f = 0; f < num_response_files; f++) free(response_buffers[f]);
+    free(response_buffers);
+    free(response_lengths);
+    free(response_sum);
 
     // 3. 信号長を統一（2のべき乗に拡張）
     int N = 1;
