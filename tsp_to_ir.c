@@ -182,6 +182,18 @@ int main(int argc, char *argv[]) {
     const char *output_file = argv[argc - 1];
     int num_response_files = argc - 3;
 
+    /* 出力先が入力ファイルと被っていないか確認（上書き事故防止） */
+    if (strcmp(output_file, tsp_file) == 0) {
+        fprintf(stderr, "エラー: 出力ファイル名がTSP信号と同一です。実験データが上書きされます: %s\n", output_file);
+        return 1;
+    }
+    for (int i = 0; i < num_response_files; i++) {
+        if (strcmp(output_file, argv[2 + i]) == 0) {
+            fprintf(stderr, "エラー: 出力ファイル名が応答ファイルと同一です。実験データが上書きされます: %s\n", output_file);
+            return 1;
+        }
+    }
+
     printf("TSP信号からインパルス応答を算出中...\n");
     printf("TSP信号: %s\n", tsp_file);
     printf("TSP応答: %d ファイル", num_response_files);
