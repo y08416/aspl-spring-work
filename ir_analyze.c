@@ -72,8 +72,34 @@ int read_wav(const char *filename, int16_t **samples, int *fs, int *num_samples)
 }
 
 /**
+ * ノイズ対策: 有効なインパルス応答長を算出
+ * ピークから指定dB以下に減衰した点で打ち切り、ノイズテールを除外する
+ * T10算出を確実にするための工夫（ノイズフロアが残響曲線を平坦化するのを防ぐ）
+ */
+int get_effective_ir_length(int16_t *ir, int len, double cutoff_db) {
+    if (len <= 0) return len;
+    int16_t peak = 0;
+    for (int i = 0; i < len; i++) {
+        int16_t a = (ir[i] >= 0) ? ir[i] : -ir[i];
+        if (a > peak) peak = a;
+    }
+    if (peak == 0) return len;
+    double threshold = peak * pow(10.0, cutoff_db / 20.0);  /* 例: -40dB → 約1/100 */
+    /* 後ろから走査し、thresholdを超える最後の位置を返す */
+    for (int i = len - 1; i >= 0; i--) {
+        int16_t s = ir[i];
+        double mag = (s == -32768) ? 32768.0 : (s >= 0 ? (double)s : -(double)s);
+        if (mag > threshold) {
+            return i + 1;  /* このサンプルまで使用 */
+        }
+    }
+    return len;  /* 全部使う */
+}
+
+/**
  * Schroeder積分で残響曲線を計算
  * E(t) = ∫[t to ∞] h^2(τ) dτ
+ * インパルス応答の2乗の後方累積積分
  */
 void schroeder_integral(int16_t *ir, int len, double *decay_curve) {
     // 後ろから累積積分
@@ -99,7 +125,8 @@ void schroeder_integral(int16_t *ir, int len, double *decay_curve) {
 
 /**
  * 線形回帰で減衰時間を計算
- * 戻り値: 減衰時間（秒）、エラー時は-1
+ * start_db から end_db の区間で傾きを求め、T10/T20（そのdB範囲の減衰時間）を算出
+ * 戻り値: T10 または T20（秒）、エラー時は-1
  */
 double calculate_decay_time(double *decay_curve, int len, int fs, 
                             double start_db, double end_db, int *start_idx, int *end_idx) {
@@ -142,14 +169,15 @@ double calculate_decay_time(double *decay_curve, int len, int fs,
 
     double slope = (n * sum_xy - sum_x * sum_y) / denominator;
 
-    // 60dB減衰に要する時間を計算
-    // slope * t = -60 より t = -60 / slope
+    // 減衰していない場合はエラー
     if (slope >= 0) {
-        return -1.0; // 減衰していない
+        return -1.0;
     }
 
-    double rt60 = -60.0 / slope;
-    return rt60;
+    // T10 または T20: そのdB範囲の減衰時間 = |end_db - start_db| / |slope|
+    double db_range = fabs(start_db - end_db);
+    double t_decay = db_range / (-slope);
+    return t_decay;
 }
 
 int main(int argc, char *argv[]) {
@@ -169,18 +197,25 @@ int main(int argc, char *argv[]) {
     printf("読み込み完了: %d サンプル, fs = %d Hz (%.3f 秒)\n", 
            num_samples, fs, (double)num_samples / fs);
 
-    // 2. Schroeder積分で残響曲線を計算
-    double *decay_curve = (double *)malloc(num_samples * sizeof(double));
-    schroeder_integral(ir_samples, num_samples, decay_curve);
+    // 2. ノイズ対策: ノイズテールを打ち切り有効長を決定（T10算出を確実にする工夫）
+    int eff_len = get_effective_ir_length(ir_samples, num_samples, -40.0);
+    if (eff_len < num_samples) {
+        printf("ノイズ対策: IRを %.3f 秒まで打ち切り（全長 %.3f 秒）\n",
+               (double)eff_len / fs, (double)num_samples / fs);
+    }
 
-    // 3. T10を計算（-5dB から -15dB）
+    // 3. Schroeder積分で残響曲線を計算（インパルス応答の2乗積分）
+    double *decay_curve = (double *)malloc((size_t)eff_len * sizeof(double));
+    schroeder_integral(ir_samples, eff_len, decay_curve);
+
+    // 4. T10を算出（残響曲線の -5 dB から -15 dB の区間）
     int t10_start, t10_end;
-    double t10 = calculate_decay_time(decay_curve, num_samples, fs, -5.0, -15.0, &t10_start, &t10_end);
-    double rt60_t10 = (t10 > 0) ? t10 * 6.0 : -1.0; // T10からRT60を外挿
+    double t10 = calculate_decay_time(decay_curve, eff_len, fs, -5.0, -15.0, &t10_start, &t10_end);
+    double rt60_t10 = (t10 > 0) ? t10 * 6.0 : -1.0;  /* T10から60dB減衰時間を近似: RT60 = T10 × 6 */
 
-    // 4. T20を計算（-5dB から -25dB）
+    // 5. T20を算出（残響曲線の -5 dB から -25 dB の区間）
     int t20_start, t20_end;
-    double t20 = calculate_decay_time(decay_curve, num_samples, fs, -5.0, -25.0, &t20_start, &t20_end);
+    double t20 = calculate_decay_time(decay_curve, eff_len, fs, -5.0, -25.0, &t20_start, &t20_end);
     double rt60_t20 = (t20 > 0) ? t20 * 3.0 : -1.0; // T20からRT60を外挿
 
     // 5. 結果を表示
@@ -208,7 +243,7 @@ int main(int argc, char *argv[]) {
         FILE *fp = fopen(curve_file, "w");
         if (fp) {
             fprintf(fp, "# 時間(秒)\tエネルギー(dB)\n");
-            for (int i = 0; i < num_samples; i++) {
+            for (int i = 0; i < eff_len; i++) {
                 fprintf(fp, "%.6f\t%.2f\n", (double)i / fs, decay_curve[i]);
             }
             fclose(fp);
