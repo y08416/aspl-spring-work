@@ -40,7 +40,6 @@ int read_wav(const char *filename, int16_t **samples, int *fs, int *num_samples)
         return -1;
     }
 
-    // WAV形式のチェック
     if (memcmp(header.riff, "RIFF", 4) != 0 || 
         memcmp(header.wave, "WAVE", 4) != 0 ||
         memcmp(header.fmt, "fmt ", 4) != 0 ||
@@ -51,7 +50,7 @@ int read_wav(const char *filename, int16_t **samples, int *fs, int *num_samples)
     }
 
     *fs = header.sample_rate;
-    *num_samples = header.data_size / 2; // 16bit = 2 bytes
+    *num_samples = header.data_size / 2;
 
     *samples = (int16_t *)malloc(*num_samples * sizeof(int16_t));
     if (!*samples) {
@@ -72,9 +71,7 @@ int read_wav(const char *filename, int16_t **samples, int *fs, int *num_samples)
 }
 
 /**
- * ノイズ対策: 有効なインパルス応答長を算出
- * ピークから指定dB以下に減衰した点で打ち切り、ノイズテールを除外する
- * T10算出を確実にするための工夫（ノイズフロアが残響曲線を平坦化するのを防ぐ）
+ * 有効なインパルス応答長を算出
  */
 int get_effective_ir_length(int16_t *ir, int len, double cutoff_db) {
     if (len <= 0) return len;
@@ -84,25 +81,22 @@ int get_effective_ir_length(int16_t *ir, int len, double cutoff_db) {
         if (a > peak) peak = a;
     }
     if (peak == 0) return len;
-    double threshold = peak * pow(10.0, cutoff_db / 20.0);  /* 例: -40dB → 約1/100 */
-    /* 後ろから走査し、thresholdを超える最後の位置を返す */
+    double threshold = peak * pow(10.0, cutoff_db / 20.0);
     for (int i = len - 1; i >= 0; i--) {
         int16_t s = ir[i];
         double mag = (s == -32768) ? 32768.0 : (s >= 0 ? (double)s : -(double)s);
         if (mag > threshold) {
-            return i + 1;  /* このサンプルまで使用 */
+            return i + 1;
         }
     }
-    return len;  /* 全部使う */
+    return len;
 }
 
 /**
- * Schroeder積分で残響曲線を計算
- * E(t) = ∫[t to ∞] h^2(τ) dτ
- * インパルス応答の2乗の後方累積積分
+ * Schroeder積分で残響曲線を計算（ピーク正規化版）
  */
-void schroeder_integral(int16_t *ir, int len, double *decay_curve) {
-    // 後ろから累積積分
+void schroeder_integral(int16_t *ir, int len, double *decay_curve, int peak_idx) {
+    // 後方累積積分を実行 [cite: 58-65]
     double sum = 0.0;
     for (int i = len - 1; i >= 0; i--) {
         double sample = (double)ir[i] / 32768.0;
@@ -110,35 +104,35 @@ void schroeder_integral(int16_t *ir, int len, double *decay_curve) {
         decay_curve[i] = sum;
     }
 
-    // 最大値で正規化してdBに変換
-    double max_energy = decay_curve[0];
+    // ピーク位置のエネルギーで正規化することで、直接音到達時を0dBとする [cite: 67-75]
+    double max_energy = decay_curve[peak_idx];
     if (max_energy > 0) {
         for (int i = 0; i < len; i++) {
-            if (decay_curve[i] > 0) {
+            if (i < peak_idx) {
+                // ピーク前はエネルギーの立ち上がり区間のため、便宜上0dB固定または計算対象外とする
+                decay_curve[i] = 0.0;
+            } else if (decay_curve[i] > 0) {
                 decay_curve[i] = 10.0 * log10(decay_curve[i] / max_energy);
             } else {
-                decay_curve[i] = -100.0; // 十分に小さい値
+                decay_curve[i] = -100.0;
             }
         }
     }
 }
 
 /**
- * 線形回帰で減衰時間を計算
- * start_db から end_db の区間で傾きを求め、T10/T20（そのdB範囲の減衰時間）を算出
- * 戻り値: T10 または T20（秒）、エラー時は-1
+ * 線形回帰で減衰時間を計算 [cite: 82-132]
  */
 double calculate_decay_time(double *decay_curve, int len, int fs, 
                             double start_db, double end_db, int *start_idx, int *end_idx) {
-    // start_db から end_db までの区間を探す
     *start_idx = -1;
     *end_idx = -1;
 
     for (int i = 0; i < len; i++) {
-        if (*start_idx < 0 && decay_curve[i] <= start_db && decay_curve[i] >= end_db) {
+        if (*start_idx < 0 && decay_curve[i] <= start_db) {
             *start_idx = i;
         }
-        if (decay_curve[i] <= end_db) {
+        if (*start_idx >= 0 && decay_curve[i] <= end_db) {
             *end_idx = i;
             break;
         }
@@ -148,36 +142,25 @@ double calculate_decay_time(double *decay_curve, int len, int fs,
         return -1.0;
     }
 
-    // 線形回帰（最小二乗法）
     double sum_x = 0.0, sum_y = 0.0, sum_xy = 0.0, sum_x2 = 0.0;
     int n = *end_idx - *start_idx + 1;
 
     for (int i = *start_idx; i <= *end_idx; i++) {
-        double x = (double)i / fs; // 時間（秒）
-        double y = decay_curve[i]; // dB
+        double x = (double)i / fs;
+        double y = decay_curve[i];
         sum_x += x;
         sum_y += y;
         sum_xy += x * y;
         sum_x2 += x * x;
     }
 
-    // 傾き a = (n*Σxy - Σx*Σy) / (n*Σx² - (Σx)²)
     double denominator = n * sum_x2 - sum_x * sum_x;
-    if (fabs(denominator) < 1e-10) {
-        return -1.0;
-    }
+    if (fabs(denominator) < 1e-10) return -1.0;
 
     double slope = (n * sum_xy - sum_x * sum_y) / denominator;
+    if (slope >= 0) return -1.0;
 
-    // 減衰していない場合はエラー
-    if (slope >= 0) {
-        return -1.0;
-    }
-
-    // T10 または T20: そのdB範囲の減衰時間 = |end_db - start_db| / |slope|
-    double db_range = fabs(start_db - end_db);
-    double t_decay = db_range / (-slope);
-    return t_decay;
+    return fabs(start_db - end_db) / (-slope);
 }
 
 int main(int argc, char *argv[]) {
@@ -186,74 +169,56 @@ int main(int argc, char *argv[]) {
     printf("インパルス応答から残響時間を算出中...\n");
     printf("入力ファイル: %s\n", ir_file);
 
-    // 1. WAVファイルを読み込む
     int16_t *ir_samples = NULL;
     int fs, num_samples;
-    if (read_wav(ir_file, &ir_samples, &fs, &num_samples) < 0) {
-        fprintf(stderr, "エラー: WAVファイルの読み込みに失敗\n");
-        return 1;
+    if (read_wav(ir_file, &ir_samples, &fs, &num_samples) < 0) return 1;
+
+    // 1. ピーク検出（直接音の到達時間を特定）
+    int peak_idx = 0;
+    double max_amp = 0;
+    for (int i = 0; i < num_samples; i++) {
+        double amp = fabs((double)ir_samples[i]);
+        if (amp > max_amp) {
+            max_amp = amp;
+            peak_idx = i;
+        }
     }
+    printf("ピーク位置: %.3f 秒 (%d サンプル)\n", (double)peak_idx / fs, peak_idx);
 
-    printf("読み込み完了: %d サンプル, fs = %d Hz (%.3f 秒)\n", 
-           num_samples, fs, (double)num_samples / fs);
-
-    // 2. ノイズ対策: ノイズテールを打ち切り有効長を決定（T10算出を確実にする工夫）
+    // 2. 有効長の決定
     int eff_len = get_effective_ir_length(ir_samples, num_samples, -40.0);
-    if (eff_len < num_samples) {
-        printf("ノイズ対策: IRを %.3f 秒まで打ち切り（全長 %.3f 秒）\n",
-               (double)eff_len / fs, (double)num_samples / fs);
-    }
 
-    // 3. Schroeder積分で残響曲線を計算（インパルス応答の2乗積分）
+    // 3. 残響曲線の計算（ピーク位置基準）
     double *decay_curve = (double *)malloc((size_t)eff_len * sizeof(double));
-    schroeder_integral(ir_samples, eff_len, decay_curve);
+    schroeder_integral(ir_samples, eff_len, decay_curve, peak_idx);
 
-    // 4. T10を算出（残響曲線の -5 dB から -15 dB の区間）
-    int t10_start, t10_end;
-    double t10 = calculate_decay_time(decay_curve, eff_len, fs, -5.0, -15.0, &t10_start, &t10_end);
-    double rt60_t10 = (t10 > 0) ? t10 * 6.0 : -1.0;  /* T10から60dB減衰時間を近似: RT60 = T10 × 6 */
+    // 4. T10 / T20 の算出 [cite: 139-153]
+    int t10_s, t10_e, t20_s, t20_e;
+    double t10 = calculate_decay_time(decay_curve, eff_len, fs, -5.0, -15.0, &t10_s, &t10_e);
+    double t20 = calculate_decay_time(decay_curve, eff_len, fs, -5.0, -25.0, &t20_s, &t20_e);
 
-    // 5. T20を算出（残響曲線の -5 dB から -25 dB の区間）
-    int t20_start, t20_end;
-    double t20 = calculate_decay_time(decay_curve, eff_len, fs, -5.0, -25.0, &t20_start, &t20_end);
-    double rt60_t20 = (t20 > 0) ? t20 * 3.0 : -1.0; // T20からRT60を外挿
-
-    // 5. 結果を表示
-    printf("\n=== 残響時間解析結果 ===\n");
-    
+    printf("\n=== 解析結果（ピーク補正済） ===\n");
     if (t10 > 0) {
-        printf("T10: %.3f 秒 (区間: %.3f - %.3f 秒)\n", 
-               t10, (double)t10_start / fs, (double)t10_end / fs);
-        printf("RT60 (T10から): %.3f 秒\n", rt60_t10);
-    } else {
-        printf("T10: 計算できませんでした（ノイズレベルが高い可能性）\n");
+        printf("T10 実測値: %.3f s\n", t10); // T10そのものの秒数
+        printf("RT60 (from T10): %.3f s\n", t10 * 6.0);
     }
-
     if (t20 > 0) {
-        printf("T20: %.3f 秒 (区間: %.3f - %.3f 秒)\n", 
-               t20, (double)t20_start / fs, (double)t20_end / fs);
-        printf("RT60 (T20から): %.3f 秒\n", rt60_t20);
-    } else {
-        printf("T20: 計算できませんでした（ノイズレベルが高い可能性）\n");
+        printf("T20 実測値: %.3f s\n", t20); // T20そのものの秒数
+        printf("RT60 (from T20): %.3f s\n", t20 * 3.0);
     }
 
-    // 6. 残響曲線をファイルに出力（オプション）
+    // 5. ファイル出力（gnuplot用）
     if (argc > 2) {
-        const char *curve_file = argv[2];
-        FILE *fp = fopen(curve_file, "w");
+        FILE *fp = fopen(argv[2], "w");
         if (fp) {
-            fprintf(fp, "# 時間(秒)\tエネルギー(dB)\n");
-            for (int i = 0; i < eff_len; i++) {
-                fprintf(fp, "%.6f\t%.2f\n", (double)i / fs, decay_curve[i]);
+            for (int i = peak_idx; i < eff_len; i++) {
+                fprintf(fp, "%.6f\t%.2f\n", (double)(i - peak_idx) / fs, decay_curve[i]);
             }
             fclose(fp);
-            printf("\n残響曲線を %s に保存しました\n", curve_file);
+            printf("\n残響曲線を %s に保存（ピーク位置を0秒として出力）\n", argv[2]);
         }
     }
 
-    // メモリ解放
-    free(ir_samples);
-    free(decay_curve);
-
+    free(ir_samples); free(decay_curve);
     return 0;
 }
